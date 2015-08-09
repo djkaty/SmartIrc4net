@@ -31,6 +31,7 @@
 using System;
 using System.Collections;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Threading;
@@ -360,6 +361,67 @@ namespace Meebey.SmartIrc4net
                 return _Lag;
             }
         }
+
+        /// <summary>
+        /// Pause or unpause the write queue
+        /// </summary>
+        public bool WriteQueuePaused {
+            get {
+                return _WriteManager.Paused;
+            }
+            set {
+                _WriteManager.Paused = value;
+            }
+        }
+
+        /// <summary>
+        /// Get the write queue length
+        /// </summary>
+        public int WriteQueueLength {
+            get {
+                return _WriteManager.Length;
+            }
+        }
+
+        /// <summary>
+        /// The maximum number of messages that can be sent in a single burst
+        /// Set to zero to disable bursting
+        /// NOTE: Bursting does not apply to Priority.Critical messages
+        /// </summary>
+        public int BurstSize { get; set; } = 0;
+
+        /// <summary>
+        /// The smallest timeframe in which BurstSize messages can be sent (in milliseconds)
+        /// If the burst limit is exceeded in the timeframe, sending will be rate limited by SendDelay
+        /// until more bursting can be done
+        /// If bursting is enabled, the client will NEVER send more than BurstSize messages in BurstInterval ms
+        /// regardless of whether a SendDelay between each message would allow it
+        /// If BurstSize messages in BurstInterval ms is reached, a SendDelay sleep will occur before checking again
+        /// Set to zero to send messages as fast as possible
+        /// </summary>
+        public int BurstInterval { get; set; } = 0;
+
+        /// <summary>
+        /// The number of burst messages in a single send after which BurstWait must elapse before attempting to burst again
+        /// </summary>
+        public int BurstWaitThreshold { get; set; } = 0;
+
+        /// <summary>
+        /// The minimum amount of time to wait after at least BurstWaitThreshold messages have been burst
+        /// before attempting to burst again (in milliseconds)
+        /// </summary>
+        /// <example>
+        /// Standard IRC server: BurstSize = 3; BurstInterval = 0; BurstWaitThreshold = 2; BurstWait = 10000
+        /// Up to 3 messages can be burst as fast as possible
+        /// If at least 2 messages were burst, wait 10 seconds before bursting again.
+        /// </example>
+        /// <example>
+        /// Twitch IRC server: BurstSize = 20; BurstInterval = 30000; BurstWaitThreshold = 0; BurstWait = 0
+        /// Up to 20 messages can be burst within 30 seconds.
+        /// Don't wait to re-burst
+        /// (this effectively rate limits the connection to a max of 20 messages per 30 seconds)
+        /// </example>
+        public int BurstWait { get; set; } = 0;
 
         /// <summary>
         /// Returns true if the connection is established and working properly, no errors have been reported and we are not disconnecting
@@ -865,14 +927,45 @@ namespace Meebey.SmartIrc4net
             private int            _AboveMediumThresholdCount = 4;
             private int            _MediumThresholdCount      = 2;
             private int            _BelowMediumThresholdCount = 1;
-            private int            _BurstCount;
+
+            private Queue<DateTime> _BurstTimes = new Queue<DateTime>();
+            private DateTime _BurstNextAllowed;
 
             private AutoResetEvent _QueuedEvent;
+            private ManualResetEvent _UnpausedEvent = new ManualResetEvent(true);
 
             /// <summary>
             /// Fires when a line has been successfully sent to the network stream
             /// </summary>
             public event WriteLineEventHandler OnWriteLine;
+
+            /// <summary>
+            /// Pause or unpause the write queue
+            /// </summary>
+            public bool Paused {
+                get {
+                    return !_UnpausedEvent.WaitOne(0);
+                }
+                set {
+                    if (value)
+                        _UnpausedEvent.Reset();
+                    else
+                        _UnpausedEvent.Set();
+                }
+            }
+
+            /// <summary>
+            /// Get the queue length
+            /// </summary>
+            public int Length {
+                get {
+                    return ((Queue) _SendBuffer[Priority.High]).Count
+                           + ((Queue) _SendBuffer[Priority.AboveMedium]).Count
+                           + ((Queue) _SendBuffer[Priority.Medium]).Count
+                           + ((Queue) _SendBuffer[Priority.BelowMedium]).Count
+                           + ((Queue) _SendBuffer[Priority.Low]).Count;
+                }
+            }
 
             /// <summary>
             /// Set up using the specified connection
@@ -896,6 +989,9 @@ namespace Meebey.SmartIrc4net
             public void Start()
             {
                 _QueuedEvent.Reset();
+                _UnpausedEvent.Set();
+                _BurstTimes.Clear();
+                _BurstNextAllowed = DateTime.Now;
 
                 ((Queue)_SendBuffer[Priority.High]).Clear();
                 ((Queue)_SendBuffer[Priority.AboveMedium]).Clear();
@@ -971,15 +1067,13 @@ namespace Meebey.SmartIrc4net
                             _QueuedEvent.WaitOne();
 
                             if (_Connection._ConnectionEstablished) {
-                                bool isBufferEmpty = false;
                                 do {
-                                    isBufferEmpty = _CheckBuffer() == 0;
-                                    Thread.Sleep(_Connection._SendDelay);
+                                    _UnpausedEvent.WaitOne();
                                     
                                     // We must check _ConnectionEstablished here because when the write fails,
                                     // it will re-queue and the buffer will never empty, causing this loop
                                     // to repeat endlessly
-                                } while (!isBufferEmpty && _Connection._ConnectionEstablished);
+                                } while (_CheckBuffer() != 0 && _Connection._ConnectionEstablished);
                             }
                         } while (_Connection._ConnectionEstablished);
                     } catch (IOException e) {
@@ -1004,44 +1098,103 @@ namespace Meebey.SmartIrc4net
             }
 
 #region WARNING: complex scheduler, don't even think about changing it!
-            // WARNING: complex scheduler, don't even think about changing it!
-            private int _CheckBuffer()
+            private int _UpdateCounts()
             {
-                _HighCount        = ((Queue)_SendBuffer[Priority.High]).Count;
-                _AboveMediumCount = ((Queue)_SendBuffer[Priority.AboveMedium]).Count;
-                _MediumCount      = ((Queue)_SendBuffer[Priority.Medium]).Count;
-                _BelowMediumCount = ((Queue)_SendBuffer[Priority.BelowMedium]).Count;
-                _LowCount         = ((Queue)_SendBuffer[Priority.Low]).Count;
+                _HighCount = ((Queue) _SendBuffer[Priority.High]).Count;
+                _AboveMediumCount = ((Queue) _SendBuffer[Priority.AboveMedium]).Count;
+                _MediumCount = ((Queue) _SendBuffer[Priority.Medium]).Count;
+                _BelowMediumCount = ((Queue) _SendBuffer[Priority.BelowMedium]).Count;
+                _LowCount = ((Queue) _SendBuffer[Priority.Low]).Count;
 
-                var msgCount = _HighCount +
+                return _HighCount +
                                _AboveMediumCount +
                                _MediumCount +
                                _BelowMediumCount +
                                _LowCount;
+            }
+
+            /// <summary>
+            /// Write queue behaviour:
+            /// - If the High buffer is not empty, send 1 message and stop
+            /// - If the AboveMedium buffer is not empty and we are below the threshold, send 1 message and stop, otherwise continue
+            /// - If the Medium buffer is not empty and we are below the threshold, send 1 message and stop, otherwise continue
+            /// - If the BelowMedium buffer is not empty and we are below the threshold, send 1 message and stop, otherwise continue
+            /// - If the Low buffer is not empty and all the other buffers are empty, send 1 message and stop
+            /// </summary>
+            /// <returns>
+            /// Number of messages remaining in all write queues combined
+            /// </returns>
+            private int _CheckBuffer()
+            {
+                // There will be at least one message in the queue if we get to this function
+                int msgCount = _UpdateCounts();
+                int newMsgCount = msgCount;
 
                 // only send data if we are succefully registered on the IRC network
                 if (!_Connection._IsRegistered) {
                     return msgCount;
                 }
 
-                if (_CheckHighBuffer() &&
-                    _CheckAboveMediumBuffer() &&
-                    _CheckMediumBuffer() &&
-                    _CheckBelowMediumBuffer() &&
-                    _CheckLowBuffer()) {
-                    // everything is sent, resetting all counters
-                    _AboveMediumSentCount = 0;
-                    _MediumSentCount      = 0;
-                    _BelowMediumSentCount = 0;
-                    _BurstCount = 0;
+                int burstCount = 0;
+
+                do {
+                    // Remove all message timestamps older than BurstInterval
+                    int prevCount = _BurstTimes.Count;
+                    while (_BurstTimes.Count > 0
+                        && _BurstTimes.Peek() <= DateTime.Now - TimeSpan.FromMilliseconds(_Connection.BurstInterval)) {
+                        _BurstTimes.Dequeue();
+                    }
+
+                    // Never send more than BurstSize messages in BurstInterval ms if bursting is enabled
+                    if (_Connection.BurstSize > 0 && _BurstTimes.Count >= _Connection.BurstSize) {
+                        Thread.Sleep(_Connection._SendDelay);
+                        return newMsgCount;
+                    }
+
+                    // Send a maximum of one message from one of the buffers
+                    // Each check returns true to continue (buffer empty or threshold met),
+                    // or false to stop (message sent or error) - evaluated left-to-right
+                    // _CheckLowBuffer() also returns true when the last message has been sent
+                    if (_CheckHighBuffer() &&
+                        _CheckAboveMediumBuffer() &&
+                        _CheckMediumBuffer() &&
+                        _CheckBelowMediumBuffer()) {
+                        _CheckLowBuffer();
+                    }
+
+                    // Buffer empty or all thresholds met?
+                    newMsgCount = _UpdateCounts();
+
+                    if (((_AboveMediumSentCount == _AboveMediumThresholdCount || _AboveMediumCount == 0)
+                        && (_MediumSentCount == _MediumThresholdCount || _MediumCount == 0)
+                        && (_BelowMediumSentCount == _BelowMediumThresholdCount || _BelowMediumCount == 0))
+                        || newMsgCount == 0) {
+                        _AboveMediumSentCount = 0;
+                        _MediumSentCount = 0;
+                        _BelowMediumSentCount = 0;
+                    }
+
+                    burstCount++;
+
+                    // Burst possible (not guaranteed) if queue not empty and bursting enabled and allowed
+                    // and we haven't exceeded the burst message limit
+                } while (newMsgCount > 0 && _Connection.BurstSize > 0 && DateTime.Now >= _BurstNextAllowed
+                        && burstCount < _Connection.BurstSize);
+
+                // If we sent at least BurstWaitThreshold messages now, don't attempt to burst again
+                // until BurstWait ms have passed
+                if (burstCount >= _Connection.BurstWaitThreshold && _Connection.BurstWaitThreshold > 0) {
+                    _BurstNextAllowed = DateTime.Now + TimeSpan.FromMilliseconds(_Connection.BurstWait);
                 }
 
-                if (_BurstCount < 3) {
-                    _BurstCount++;
-                    //_CheckBuffer();
+                // If we sent anything, and we can't burst anymore, or bursting is disabled, sleep
+                if ((newMsgCount < msgCount && _BurstNextAllowed > DateTime.Now
+                    && _Connection.BurstWaitThreshold > 0)
+                    || _Connection.BurstSize == 0) {
+                    Thread.Sleep(_Connection._SendDelay);
                 }
 
-                return msgCount;
+                return newMsgCount;
             }
 
             private bool _CheckHighBuffer()
@@ -1053,14 +1206,12 @@ namespace Meebey.SmartIrc4net
                         Logger.Queue.Warn("Sending data was not sucessful, data is requeued!");
 #endif
                         ((Queue)_SendBuffer[Priority.High]).Enqueue(data);
-                        return false;
+                    } else {
+                        _BurstTimes.Enqueue(DateTime.Now);
                     }
 
-                    if (_HighCount > 1) {
-                        // there is more data to send
                         return false;
                     }
-                }
 
                 return true;
             }
@@ -1077,12 +1228,11 @@ namespace Meebey.SmartIrc4net
                         ((Queue)_SendBuffer[Priority.AboveMedium]).Enqueue(data);
                         return false;
                     }
+                    _BurstTimes.Enqueue(DateTime.Now);
                     _AboveMediumSentCount++;
 
-                    if (_AboveMediumSentCount < _AboveMediumThresholdCount) {
                         return false;
                     }
-                }
 
                 return true;
             }
@@ -1099,12 +1249,11 @@ namespace Meebey.SmartIrc4net
                         ((Queue)_SendBuffer[Priority.Medium]).Enqueue(data);
                         return false;
                     }
+                    _BurstTimes.Enqueue(DateTime.Now);
                     _MediumSentCount++;
 
-                    if (_MediumSentCount < _MediumThresholdCount) {
                         return false;
                     }
-                }
 
                 return true;
             }
@@ -1121,12 +1270,11 @@ namespace Meebey.SmartIrc4net
                         ((Queue)_SendBuffer[Priority.BelowMedium]).Enqueue(data);
                         return false;
                     }
+                    _BurstTimes.Enqueue(DateTime.Now);
                     _BelowMediumSentCount++;
 
-                    if (_BelowMediumSentCount < _BelowMediumThresholdCount) {
                         return false;
                     }
-                }
 
                 return true;
             }
@@ -1138,7 +1286,7 @@ namespace Meebey.SmartIrc4net
                         (_AboveMediumCount > 0) ||
                         (_MediumCount > 0) ||
                         (_BelowMediumCount > 0)) {
-                        return true;
+                        return false;
                     }
 
                     string data = (string)((Queue)_SendBuffer[Priority.Low]).Dequeue();
@@ -1149,6 +1297,7 @@ namespace Meebey.SmartIrc4net
                         ((Queue)_SendBuffer[Priority.Low]).Enqueue(data);
                         return false;
                     }
+                    _BurstTimes.Enqueue(DateTime.Now);
 
                     if (_LowCount > 1) {
                         return false;

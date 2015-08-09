@@ -593,6 +593,193 @@ namespace Meebey.SmartIrc4net
             }
         }
 
+        /// <summary>
+        /// Tests the behaviour of the priority queues meets expectations
+        /// </summary>
+        [Test]
+        public void PriorityWriteQueueTest()
+        {
+            // Start fake IRC server
+            FakeIrcServerTask fakeIrc = new FakeIrcServerTask();
+            fakeIrc.Start();
+
+            // For checking the write queue works as we want
+            string lastExpected = "";
+            string lastReceived = "";
+            Queue<string> expectedLines = new Queue<string>();
+
+            try {
+                // Start the client
+                IrcTcpTransport tcp = new IrcTcpTransport(FakeIrcServerTask.Address, FakeIrcServerTask.Port);
+                tcp.Encoding = Encoding.UTF8;
+
+                irc.SendDelay = 300;
+
+                AutoResetEvent joined = new AutoResetEvent(false);
+
+                irc.OnJoin += (s, e) => {
+                    joined.Set();
+                };
+
+                runConnectionScenario(tcp, () => {
+
+                    // Wait for the initial JOIN to complete
+                    joined.WaitOne();
+
+                    // Fill queue
+                    irc.WriteQueuePaused = true;
+
+                    Dictionary<Priority, int> queueLengths = new Dictionary<Priority, int> {
+                        { Priority.High, 2 },
+                        { Priority.AboveMedium, 6 },
+                        { Priority.Medium, 3 },
+                        { Priority.BelowMedium, 4 },
+                        { Priority.Low, 3 }
+                    };
+
+                    foreach (var kvp in queueLengths)
+                        for (int i = 0; i < kvp.Value; i++)
+                            irc.WriteLine(kvp.Key.ToString() + " " + i, kvp.Key);
+
+                    // Calculate the expected transmission order
+                    for (int i = 0; queueLengths[Priority.High]-- > 0; i++) {
+                        expectedLines.Enqueue(Priority.High.ToString() + " " + i);
+                    }
+
+                    int thresholdAM = 4;
+                    int thresholdM = 2;
+                    int thresholdBM = 1;
+
+                    int sentAMtotal = 0;
+                    int sentMtotal = 0;
+                    int sentBMtotal = 0;
+
+                    while (queueLengths[Priority.BelowMedium] > 0) {
+                        for (int sentAM = 0; sentAM < thresholdAM && queueLengths[Priority.AboveMedium]-- > 0; sentAM++) {
+                            expectedLines.Enqueue(Priority.AboveMedium.ToString() + " " + sentAMtotal++);
+                        }
+
+                        for (int sentM = 0; sentM < thresholdM && queueLengths[Priority.Medium]-- > 0; sentM++) {
+                            expectedLines.Enqueue(Priority.Medium.ToString() + " " + sentMtotal++);
+                        }
+
+                        for (int sentBM = 0; sentBM < thresholdBM && queueLengths[Priority.BelowMedium]-- > 0; sentBM++) {
+                            expectedLines.Enqueue(Priority.BelowMedium.ToString() + " " + sentBMtotal++);
+                        }
+                    }
+
+                    for (int i = 0; queueLengths[Priority.Low]-- > 0; i++) {
+                        expectedLines.Enqueue(Priority.Low.ToString() + " " + i);
+                    }
+
+                    // Compare received lines with expectation
+                    AutoResetEvent received = new AutoResetEvent(false);
+
+                    WriteLineEventHandler writeLine = (s, e) => {
+                        lock (this) {
+                            lastExpected = expectedLines.Dequeue();
+                            lastReceived = e.Line;
+                        }
+                        received.Set();
+                    };
+
+                    irc.OnWriteLine += writeLine;
+                    irc.WriteQueuePaused = false;
+
+                    // We have to Assert the received messages on this thread to make sure NUnit gets the exception
+                    while (irc.WriteQueueLength > 0) {
+                        received.WaitOne();
+
+                        lock (this) {
+                            if (lastExpected != lastReceived) {
+                                irc.OnWriteLine -= writeLine;
+                                break;
+                            }
+                        }
+                    }
+
+                    irc.Disconnect();
+
+                }, false, false);
+            } finally {
+                fakeIrc.Stop();
+
+                Assert.That(lastExpected == lastReceived, "Unexpected transmission order: " + lastReceived + " (expected: " + lastExpected + ")");
+            }
+        }
+
+        /// <summary>
+        /// Test the bursting functionality works as expected
+        /// </summary>
+        [Test]
+        public void BurstTest()
+        {
+            // Start fake IRC server
+            FakeIrcServerTask fakeIrc = new FakeIrcServerTask();
+            fakeIrc.Start();
+
+            try {
+                // Start the client
+                IrcTcpTransport tcp = new IrcTcpTransport(FakeIrcServerTask.Address, FakeIrcServerTask.Port);
+                tcp.Encoding = Encoding.UTF8;
+
+                // Set burst parameters
+
+                // Rate limit to 10 messages per second, free burst
+                irc.BurstSize = 10;
+                irc.BurstInterval = 1000;
+                irc.BurstWaitThreshold = 0;
+                irc.BurstWait = 0;
+                irc.SendDelay = 3000;
+
+                // 3-message burst with 10 second cooldown, otherwise send one message per 500ms
+                //irc.BurstSize = 3;
+                //irc.BurstInterval = 0;
+                //irc.BurstWaitThreshold = 2;
+                //irc.BurstWait = 10000;
+                //irc.SendDelay = 500;
+
+                AutoResetEvent joined = new AutoResetEvent(false);
+
+                irc.OnJoin += (s, e) => {
+                    joined.Set();
+                };
+
+                runConnectionScenario(tcp, () => {
+
+                    // Wait for the initial JOIN to complete
+                    joined.WaitOne();
+
+                    // Fill queue
+                    irc.WriteQueuePaused = true;
+
+                    // Queue a bunch of messages
+                    for (int i = 0; i < 1000; i++) {
+                        irc.WriteLine("Line " + i, Priority.Medium);
+                    }
+
+                    AutoResetEvent received = new AutoResetEvent(false);
+
+                    WriteLineEventHandler writeLine = (s, e) => {
+                        received.Set();
+                    };
+
+                    irc.OnWriteLine += writeLine;
+                    irc.WriteQueuePaused = false;
+
+                    // We have to Assert the received messages on this thread to make sure NUnit gets the exception
+                    while (irc.WriteQueueLength > 0) {
+                        received.WaitOne();
+                    }
+
+                    irc.Disconnect();
+
+                }, false, false);
+            } finally {
+                fakeIrc.Stop();
+            }
+        }
+
         // TODO: Test auto-relogin scenarios
     }
 
