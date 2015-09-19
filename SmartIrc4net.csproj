@@ -44,6 +44,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="src\AssemblyInfo.cs" />
+    <Compile Include="src\IrcConnection\IrcConnection.cs" />
     <Compile Include="src\IrcTransport\IIrcTransportManager.cs" />
     <Compile Include="src\IrcTransport\IrcTcpTransport.cs" />
     <Compile Include="src\IrcTransport\IrcWebSocketTransport.cs" />
@@ -53,7 +54,6 @@
     <Compile Include="src\Consts.cs" />
     <Compile Include="src\EventArgs.cs" />
     <Compile Include="src\Exceptions.cs" />
-    <Compile Include="src\IrcConnection\IrcConnection.cs" />
     <Compile Include="src\IrcConnection\Delegates.cs" />
     <Compile Include="src\IrcConnection\EventArgs.cs" />
     <Compile Include="src\IrcCommands\IrcCommands.cs" />
