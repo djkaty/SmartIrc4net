@@ -290,8 +290,15 @@ namespace Meebey.SmartIrc4net
                         {
                             return certValidation(this, certificate, chain, sslPolicyErrors);
                         };
+                    LocalCertificateSelectionCallback selectionCallback = delegate (object sender, string targetHost, X509CertificateCollection localCertificates, X509Certificate remoteCertificate, string[] acceptableIssuers) {
+                        if (localCertificates == null || localCertificates.Count == 0) {
+                            return null;
+                        }
+                        return localCertificates[0];
+                    };
                     SslStream sslStream = new SslStream(stream, false,
-                                                        certValidationWithIrcAsSender);
+                                                        certValidationWithIrcAsSender,
+                                                        selectionCallback);
                     try {
                         if (SslClientCertificate != null)
                         {
