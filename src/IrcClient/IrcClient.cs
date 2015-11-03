@@ -474,7 +474,7 @@ namespace Meebey.SmartIrc4net
 #endif
             OnReadLine        += new ReadLineEventHandler(_Worker);
             OnDisconnected    += new EventHandler(_OnDisconnected);
-            OnConnectionError += new EventHandler(_OnConnectionError);
+            OnReconnected     += new EventHandler(_OnReconnected);
 
             ChannelModeMap = new ChannelModeMap();
         }
@@ -1262,9 +1262,8 @@ namespace Meebey.SmartIrc4net
             _SyncingCleanup();
         }
         
-        private void _OnConnectionError(object sender, EventArgs e)
+        private void _OnReconnected(object sender, EventArgs e)
         {
-            // TODO: This code is in the wrong place
             try {
                 // AutoReconnect is handled in IrcConnection._OnConnectionError
                 if (AutoReconnect && AutoRelogin) {

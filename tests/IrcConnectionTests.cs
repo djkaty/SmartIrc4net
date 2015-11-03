@@ -233,8 +233,10 @@ namespace Meebey.SmartIrc4net
         /// </summary>
         private void enableAutoReconnect(bool reconnect)
         {
-            if (!reconnect)
+            if (!reconnect) {
+                irc.AutoReconnect = false;
                 return;
+            }
 
             irc.AutoReconnect = true;
             irc.AutoRetryDelay = 2;
@@ -251,14 +253,21 @@ namespace Meebey.SmartIrc4net
         /// Connects to an IRC server with a well-known configuration, runs a connection scenario in another thread
         /// and checks that everything went according to plan
         /// </summary>
-        /// <param name="connectionTask">The connection scenario to run in another thread</param>
-        private void runConnectionScenario(IIrcTransportManager transport, Action connectionMethod, bool wantError, bool reconnect,
-                                            bool connectionExpected = true)
+        /// <param name="transport">The transport to use for the connection</param>
+        /// <param name="connectionMethod">The test code to run when IrcClient.OnConnected is raised</param>
+        /// <param name="wantError">True if we are hoping for IsConnectionError, false otherwise</param>
+        /// <param name="reconnect">True to enable auto-reconnect (if overwriteReconnectConfig is also true)</param>
+        /// <param name="connectionExpected">True if we expect to receive data from the IRC server, false otherwise</param>
+        /// <param name="overwriteReconnectConfig">True to honour 'reconnect' parameter, false to ignore (use this when setting up auto-reconnect directly from the test method)</param>
+        private void runConnectionScenario(IIrcTransportManager transport, Func<Task<string>> connectionMethod, bool wantError, bool reconnect,
+                                            bool connectionExpected = true, bool overwriteReconnectConfig = true)
         {
             int rx = 0;
             int gotErrorEvent = 0;
             int gotDisconnectingEvent = 0;
             int gotDisconnectedEvent = 0;
+
+            Task<string> task = null;
 
             // Configure connection
             irc.IdleWorkerInterval = Math.Min(pingInterval, pingTimeout) / 5;
@@ -313,11 +322,12 @@ namespace Meebey.SmartIrc4net
 
             // Run the scenario in another thread once the connection is established
             irc.OnConnected += (s, e) => {
-                Task.Run(connectionMethod);
+                task = Task.Run(connectionMethod);
             };
 
             // Enable auto-reconnect if applicable to test
-            enableAutoReconnect(reconnect);
+            if (overwriteReconnectConfig)
+                enableAutoReconnect(reconnect);
 
             // Note how many connection events we're expecting
             int eventExpectation = irc.AutoReconnect ? maxReconnects + 1 : 1;
@@ -333,7 +343,7 @@ namespace Meebey.SmartIrc4net
                 totalConnects++;
             }
 
-            if ((totalConnects >= 8 && !lastServer.Contains("127.0.0.1") && !lastServer.Contains("localhost")) || irc.AutoReconnect) {
+            if ((totalConnects >= 8 || irc.AutoReconnect) && !lastServer.Contains("127.0.0.1") && !lastServer.Contains("localhost")) {
                 reconnectDelay = 30000;
                 totalConnects = 1;
             } else {
@@ -358,6 +368,14 @@ namespace Meebey.SmartIrc4net
             // and disconnected and closed all our threads cleanly
 
             // NOTE: Doesn't guarantee the events were received in the right order
+
+            // Prioritise errors from the test method
+            if (task != null) {
+                string methodResponse = task.Result;
+
+                if (methodResponse != string.Empty)
+                    Assert.Fail(methodResponse);
+            }
 
             // Check situation is as it should be
             Assert.AreEqual(false, irc.IsConnected, "Incorrect value for IsConnected");
@@ -390,6 +408,8 @@ namespace Meebey.SmartIrc4net
                     irc.Reconnect();
                 else
                     irc.Disconnect();
+
+                return string.Empty;
             }, false, reconnect);
         }
 
@@ -407,6 +427,8 @@ namespace Meebey.SmartIrc4net
                 ipNumbers = ipNumbers.Substring(ipNumbers.LastIndexOf("/") + 1);
 
                 destroyTcpConnection(ipNumbers);
+
+                return string.Empty;
             }, true, reconnect);
         }
 
@@ -516,7 +538,7 @@ namespace Meebey.SmartIrc4net
 
             // Don't do anything in a separate thread, just check for IsConnectionError
             Assert.Throws<CouldNotConnectException>(() => {
-                runConnectionScenario(tcp, () => { }, true, false, false);
+                runConnectionScenario(tcp, () => { return Task.FromResult(string.Empty); }, true, false, false);
             });
         }
 
@@ -551,6 +573,8 @@ namespace Meebey.SmartIrc4net
                     Debug.WriteLine("Disabling pongs");
 
                     fakeIrc.SendPong = false;
+
+                    return string.Empty;
                 }, true, reconnect);
             } catch (Exception e) {
                 Debug.WriteLine(e.Message);
@@ -585,6 +609,8 @@ namespace Meebey.SmartIrc4net
                     Debug.WriteLine("Killing connection from server side");
 
                     fakeIrc.Reset();
+
+                    return string.Empty;
                 }, true, reconnect);
             } catch (Exception e) {
                 Debug.WriteLine(e.Message);
@@ -700,6 +726,8 @@ namespace Meebey.SmartIrc4net
 
                     irc.Disconnect();
 
+                    return Task.FromResult(string.Empty);
+
                 }, false, false);
             } finally {
                 fakeIrc.Stop();
@@ -774,13 +802,132 @@ namespace Meebey.SmartIrc4net
 
                     irc.Disconnect();
 
+                    return Task.FromResult(string.Empty);
+
                 }, false, false);
             } finally {
                 fakeIrc.Stop();
             }
         }
 
-        // TODO: Test auto-relogin scenarios
+        /// <summary>
+        /// Tests that auto-reconnect, auto-relogin and auto-rejoin work as expected
+        /// </summary>
+        /// <param name="reconnectMethod">Method of reconnection: 1. force server-side disconnect, 2. ping timeout, 3. client-requested reconnect</param>
+        [Test]
+        public void FullAutoTest([Values(1,2,3)] int reconnectMethod)
+        {
+            // Start fake IRC server
+            FakeIrcServerTask fakeIrc = new FakeIrcServerTask();
+            fakeIrc.Start();
+
+            // Configure full automation
+            irc.AutoReconnect = true;
+            irc.AutoRejoin = true;
+            irc.AutoRelogin = true;
+            irc.AutoRetryDelay = 2;
+
+            try {
+                // Start the client
+                IrcTcpTransport tcp = new IrcTcpTransport(FakeIrcServerTask.Address, FakeIrcServerTask.Port);
+                tcp.Encoding = Encoding.UTF8;
+
+                pingInterval = 10;
+                pingTimeout = 5;
+
+                bool firstConnect = true;
+
+                runConnectionScenario(tcp, async () => {
+
+                    // This method runs every time OnConnected fires
+                    // so skip the whole thing on subsequent connects
+
+                    if (firstConnect) {
+                        firstConnect = false;
+
+                        // Join a few more channels (join #smartirc-test by default)
+                        irc.RfcJoin("#test2");
+                        irc.RfcJoin("#test3");
+
+                        for (int r = 0; r < maxReconnects + 1; r++) {
+
+                            // Wait until we are connected, logged in (registered) and joined all channels
+                            for (int i = 0; (!irc.IsConnected || !irc.IsRegistered || irc.JoinedChannels.Count != 3) && i < 10; i++)
+                                await Task.Delay(1000);
+
+                            if (!irc.IsConnected)
+                                return "Did not reconnect";
+
+                            if (!irc.IsRegistered) {
+                                irc.Disconnect();
+                                return "Did not re-register";
+                            }
+
+                            if (irc.JoinedChannels.Count != 3) {
+                                irc.Disconnect();
+                                return "Did not re-join the expected number of channels (" + irc.JoinedChannels.Count + " / 3";
+                            }
+
+                            Debug.WriteLine("All channels joined!");
+
+                            // Start a reconnect
+
+                            // Don't reconnect on the last time around the loop
+                            if (r == maxReconnects)
+                                irc.AutoReconnect = false;
+
+                            // Wait for disconnect before looping
+                            AutoResetEvent disconnected = new AutoResetEvent(false);
+
+                            EventHandler onDisconnected = (s, e) => {
+                                disconnected.Set();
+                            };
+
+                            irc.OnDisconnected += onDisconnected;
+
+                            // Force disconnect
+                            Debug.WriteLine("Forcing reconnect");
+
+                            switch (reconnectMethod) {
+                                // Force a server-side disconnect, this should trigger IrcClient to attempt a reconnect
+                                case 1:
+                                fakeIrc.Reset();
+                                break;
+
+                                // Force a ping timeout
+                                case 2:
+                                fakeIrc.SendPong = false;
+                                break;
+
+                                // Clean reconnect
+                                case 3:
+                                if (irc.AutoReconnect) // this line is just to stop a full re-connect on the last loop run
+                                    irc.Reconnect();
+                                else
+                                    irc.Disconnect();
+                                break;
+                            }
+
+                            // Wait for disconnection to complete
+                            disconnected.WaitOne();
+
+                            irc.OnDisconnected -= onDisconnected;
+                        }
+                        try {
+                            irc.Disconnect();
+                        } catch (NotConnectedException) { }
+                    }
+
+                    return string.Empty;
+                }, (reconnectMethod != 3), true, true, false);
+
+            } catch (Exception e) {
+                Debug.WriteLine(e.Message);
+                throw e;
+            } finally {
+                fakeIrc.Stop();
+            }
+        }
     }
 
     /// <summary>
@@ -897,21 +1044,27 @@ namespace Meebey.SmartIrc4net
                                     Thread.Sleep(2000);
 
                                     // Send just enough stuff to pacify SmartIrc4net into continuing
-                                    writer.WriteLine(":" + Address + " 001 :SmartIRC Welcome message");
-                                    writer.WriteLine(":" + Address + " 375 :Start MOTD");
-                                    writer.WriteLine(":" + Address + " 372 :MOTD");
-                                    writer.WriteLine(":" + Address + " 375 :End of /MOTD command.");
+                                    writer.WriteLine(":" + Address + " 001 " + nick + " :SmartIRC Welcome message");
+                                    writer.WriteLine(":" + Address + " 375 " + nick + " :Start MOTD");
+                                    writer.WriteLine(":" + Address + " 372 " + nick + " :MOTD");
+                                    writer.WriteLine(":" + Address + " 375 " + nick + " :End of /MOTD command.");
                                     break;
 
                                     // Join channel
                                     case "JOIN":
 
-                                    string channel = line.Substring(line.IndexOf(" ") + 1);
+                                    List<string> channels = line.Substring(line.IndexOf(" ") + 1).Split(',').ToList();
 
-                                    writer.WriteLine(":" + nick + "!" + Address + " JOIN " + channel);
-                                    writer.WriteLine(":" + Address + " MODE " + channel + " +ns");
-                                    writer.WriteLine(":" + Address + " 353 " + nick + " @ " + channel + " :@" + nick);
-                                    writer.WriteLine(":" + Address + " 356 " + nick + " " + channel + " :End of /NAMES list.");
+                                    foreach (string chan in channels) {
+                                        string channel = chan.Trim();
+
+                                        if (channel.Length > 0) {
+                                            writer.WriteLine(":" + nick + "!" + Address + " JOIN " + channel);
+                                            writer.WriteLine(":" + Address + " MODE " + channel + " +ns");
+                                            writer.WriteLine(":" + Address + " 353 " + nick + " @ " + channel + " :@" + nick);
+                                            writer.WriteLine(":" + Address + " 356 " + nick + " " + channel + " :End of /NAMES list.");
+                                        }
+                                    }
                                     break;
 
                                     // Ping
